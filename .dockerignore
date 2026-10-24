@@ -1,0 +1,10 @@
+.env
+.venv
+__pycache__
+*.pyc
+*.log
+*.pid
+tests/out
+sim_response.wav
+.git
+.gitignore

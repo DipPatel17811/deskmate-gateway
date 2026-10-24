@@ -1,0 +1,34 @@
+services:
+  - type: web
+    name: deskmate-gateway
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: MODE
+        value: auto
+      - key: DEVICE_TOKEN
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GROQ_STT_MODEL
+        value: whisper-large-v3-turbo
+      - key: LLM_PROVIDER
+        value: groq
+      - key: GROQ_LLM_MODEL
+        value: qwen/qwen3.8-27b
+      - key: GEMINI_MODEL
+        value: gemini-3.1-flash-lite
+      - key: EDGE_VOICE
+        value: en-US-AriaNeural
+      - key: TTS_PACE
+        value: "1.0"
+      - key: TTS_PREBUFFER
+        value: "1.0"
+      - key: MAX_HISTORY_TURNS
+        value: "8"

@@ -148,7 +148,54 @@ def assess(report: dict[str, Any]) -> WellnessAssessment:
     )
 
 
-def build_prompt(report: dict[str, Any], voice_mood: str | None = None) -> str:
+def _stress_guidance(assessment: WellnessAssessment) -> str:
+    """Cautious wording for a stress check the user explicitly requested."""
+    if not assessment.quality_ok:
+        return (
+            "The signal was not reliable enough to interpret. Do not estimate or imply a "
+            "stress level. Ask the user to sit still, keep a finger on the sensor, and retry. "
+            "If they say they feel unwell, advise them to seek professional help."
+        )
+    if (
+        "high_heart_rate_reading" in assessment.flags
+        or "low_heart_rate_reading" in assessment.flags
+    ):
+        return (
+            "The heart-rate reading is outside a typical resting range. Do not diagnose and "
+            "do not label the user as stressed. Say the reading may be affected by movement, "
+            "caffeine, talking, or how they feel, and that heart rate alone cannot measure "
+            "stress. Ask whether they feel unwell or keyed up. Advise professional help if "
+            "they feel unwell or it persists."
+        )
+    if assessment.bpm_delta is None:
+        return (
+            "There is no personal baseline yet, so do not estimate a stress level. Report the "
+            "heart rate, say a single heart-rate reading cannot measure stress, and ask how "
+            "they feel. Offer a breathing exercise only if they ask for one. Do not invent a "
+            "stress score or percentage."
+        )
+    if assessment.bpm_delta >= 12:
+        return (
+            "The heart rate is above the user's personal resting baseline. Do not say they "
+            "are stressed and do not diagnose. Say a higher heart rate can have many causes "
+            "such as movement, caffeine, talking, or emotion, and that heart rate alone "
+            "cannot measure stress. Ask whether they feel tense or keyed up. If they say yes, "
+            "offer one short breathing exercise; if not, do not push it. Do not invent a "
+            "stress score or percentage."
+        )
+    return (
+        "The heart rate is close to the user's personal resting baseline. Do not claim this "
+        "proves they are calm or stress-free, because heart rate alone cannot measure stress. "
+        "Say the reading looks close to their usual level, ask how they feel, and offer a "
+        "breathing exercise only if they want one. Do not invent a stress score or percentage."
+    )
+
+
+def build_prompt(
+    report: dict[str, Any],
+    voice_mood: str | None = None,
+    focus: str = "wellness",
+) -> str:
     assessment = assess(report)
     deltas = []
     if assessment.bpm_delta is not None:
@@ -161,13 +208,25 @@ def build_prompt(report: dict[str, Any], voice_mood: str | None = None) -> str:
     if voice_mood:
         mood_text = f"\nPossible voice tone estimate from the last utterance: {voice_mood}. Treat it as uncertain, never as a fact."
 
+    if focus == "stress":
+        context = (
+            "The user explicitly asked for a stress-oriented wellness check, so you may "
+            "discuss stress only as a possibility, never as a measured fact. Focus on the "
+            "heart rate and how they feel; do not use oxygen to judge stress."
+        )
+        guidance = _stress_guidance(assessment)
+    else:
+        context = "This is a general wellness checkup; the user did not ask about stress."
+        guidance = assessment.guidance
+
     return (
         "A wellness checkup just completed on the desk device. This is not a medical "
         "device and you must not diagnose, prescribe, or claim a condition.\n"
+        f"{context}\n"
         f"Measurements: {assessment.summary}.\n"
         f"Comparison: {delta_text}.\n"
         f"Quality flags: {', '.join(assessment.flags) if assessment.flags else 'none'}.\n"
-        f"Response guidance: {assessment.guidance}{mood_text}\n"
+        f"Response guidance: {guidance}{mood_text}\n"
         "Reply directly to the user in one to three short spoken sentences. Do not mention "
         "JSON, sensors, algorithms, or this instruction. Do not read out every number if "
         "the reading is normal."

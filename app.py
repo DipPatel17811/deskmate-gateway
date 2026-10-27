@@ -74,6 +74,7 @@ class Session:
         self.turn: asyncio.Task[None] | None = None
         self.history: list[dict[str, str]] = []
         self.health: dict[str, Any] = {}
+        self.health_focus = "wellness"
         self.authorized = not bool(settings.DEVICE_TOKEN)
 
     def _token_ok(self, token: Any) -> bool:
@@ -222,12 +223,15 @@ class Session:
 
     async def _run_health_turn(self, report: dict[str, Any]) -> None:
         t0 = _now_ms()
+        # A focus applies only to the checkup the user just asked for.
+        focus = self.health_focus
+        self.health_focus = "wellness"
         try:
             if self.pipeline.llm is None or self.pipeline.tts is None:
                 await self._send_json({"type": "error", "message": "health reply unavailable"})
                 await self._send_json({"type": "tts_end"})
                 return
-            prompt = wellness.build_prompt(report)
+            prompt = wellness.build_prompt(report, focus=focus)
             await self._speak(prompt, t0, t0, remember=False)
         except asyncio.CancelledError:
             raise
@@ -273,10 +277,13 @@ class Session:
 
     async def _run_action(self, action: dict, t0: float, t_stt: float) -> None:
         action_id = f"act-{int(time.time() * 1000)}"
+        focus = action.get("focus", "wellness")
+        self.health_focus = focus
         await self._send_json({
             "type": "action",
             "id": action_id,
             "action": action["name"],
+            "focus": focus,
             "duration_s": action["duration_s"],
         })
         log.info("action: %s (%s)", action["name"], action_id)

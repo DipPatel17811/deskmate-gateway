@@ -27,25 +27,31 @@ _SUMMARY_PATTERNS = (
         r"\bhow (?:has|have|is)\b.*\b(heart rate|heart|bpm|pulse|health)\b"
         r".*\b(been|trending|doing)\b"
     ),
+    re.compile(r"\b(past|saved|previous|earlier|recent)\b.*\breadings?\b"),
+    re.compile(r"\breadings?\b.*\b(so far|over time|history|trend|average|summary)\b"),
 )
 
 _HEALTH_PATTERNS = (
     re.compile(
         r"\b(health|wellness|vitals?)\b"
-        r".*\b(check|checkup|scan|test|reading|measure|report)\b"
+        r".*\b(check|checkup|scan|test|reading|measure|report|analysis)\b"
     ),
     re.compile(
-        r"\b(check|do|start|begin|run|take|measure|read|scan)\b"
+        r"\b(check|do|start|begin|run|take|measure|read|scan|analyse|analyze)\b"
         r".*\b(health|wellness|vitals?)\b(?! insurance)"
     ),
     re.compile(
-        r"\b(check|measure|take|scan|get|read|monitor)\b"
+        r"\b(check|measure|take|scan|get|read|monitor|analyse|analyze)\b"
         r".*\b(heart rate|heart|pulse|bpm|beats per minute|oxygen|spo2|"
         r"blood oxygen|vitals?)\b"
     ),
     re.compile(
+        r"\b(analyse|analyze|analysis|assess|assessment)\b"
+        r".*\b(heart rate|heart|bpm|pulse|health|wellness|vitals?)\b"
+    ),
+    re.compile(
         r"\b(heart rate|heart|pulse|bpm|beats per minute|blood oxygen|"
-        r"oxygen level|spo2|vitals?)\b.*\b(check|reading|measure|scan|number|level)\b"
+        r"oxygen level|spo2|vitals?)\b.*\b(check|reading|measure|scan|number|level|analysis)\b"
     ),
     re.compile(
         r"\b(what(?:'s| is)|how(?:'s| is)|tell me)\b"

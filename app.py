@@ -20,7 +20,9 @@ from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
+import actions
 import settings
+import wellness
 from audio_utils import chunks
 from protocol import split_sentences
 from providers import Pipeline, build_pipeline
@@ -71,6 +73,7 @@ class Session:
         self.pcm = bytearray()
         self.turn: asyncio.Task[None] | None = None
         self.history: list[dict[str, str]] = []
+        self.health: dict[str, Any] = {}
         self.authorized = not bool(settings.DEVICE_TOKEN)
 
     def _token_ok(self, token: Any) -> bool:
@@ -172,6 +175,13 @@ class Session:
             self.pcm.clear()
             log.info("text: %s", prompt[:200])
             self.turn = asyncio.create_task(self._run_text_turn(prompt))
+        elif kind == "health_report":
+            await self._on_health_report(msg)
+        elif kind == "action_ack":
+            log.info(
+                "action_ack: %s ok=%s %s",
+                msg.get("action"), msg.get("ok"), msg.get("error", ""),
+            )
 
     async def _on_audio(self, data: bytes) -> None:
         limit = settings.MAX_UTTERANCE_SECONDS * settings.SAMPLE_RATE * 2
@@ -179,6 +189,56 @@ class Session:
             self.pcm.extend(data[: limit - len(self.pcm)])
         if self.pipeline.mode == "echo":
             await self.ws.send_bytes(data)
+
+    async def _on_health_report(self, report: dict[str, Any]) -> None:
+        bpm = report.get("bpm")
+        spo2 = report.get("spo2")
+        if not isinstance(bpm, (int, float)) or bpm <= 0:
+            await self._send_json(
+                {"type": "health_ack", "id": report.get("id"), "ok": False,
+                 "message": "invalid health report"}
+            )
+            return
+
+        # SpO2 is optional: the device may finish a checkup with heart rate only.
+        if not isinstance(spo2, (int, float)) or spo2 <= 0:
+            spo2 = None
+            report["spo2_available"] = False
+        report["spo2"] = spo2
+
+        self.health = dict(report)
+        await self._cancel_turn()
+        self.pcm.clear()
+        await self._send_json(
+            {"type": "health_ack", "id": report.get("id"), "ok": True,
+             "spo2_available": report.get("spo2_available", True)}
+        )
+        log.info(
+            "health: bpm=%s spo2=%s available=%s signal=%s",
+            report.get("bpm"), report.get("spo2"),
+            report.get("spo2_available", True), report.get("signal_quality"),
+        )
+        self.turn = asyncio.create_task(self._run_health_turn(report))
+
+    async def _run_health_turn(self, report: dict[str, Any]) -> None:
+        t0 = _now_ms()
+        try:
+            if self.pipeline.llm is None or self.pipeline.tts is None:
+                await self._send_json({"type": "error", "message": "health reply unavailable"})
+                await self._send_json({"type": "tts_end"})
+                return
+            prompt = wellness.build_prompt(report)
+            await self._speak(prompt, t0, t0, remember=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - surfaced to the device UI
+            if isinstance(exc, ExceptionGroup) and exc.exceptions:
+                exc = exc.exceptions[0]
+            log.exception("health turn failed: %s", exc)
+            await self._send_json(
+                {"type": "error", "message": f"{type(exc).__name__}: {exc}"[:200]}
+            )
+            await self._send_json({"type": "tts_end"})
 
     async def _finish_speech(self) -> None:
         if self.pipeline.mode == "echo":
@@ -211,6 +271,17 @@ class Session:
             self.turn.cancel()
         self.turn = None
 
+    async def _run_action(self, action: dict, t0: float, t_stt: float) -> None:
+        action_id = f"act-{int(time.time() * 1000)}"
+        await self._send_json({
+            "type": "action",
+            "id": action_id,
+            "action": action["name"],
+            "duration_s": action["duration_s"],
+        })
+        log.info("action: %s (%s)", action["name"], action_id)
+        await self._speak(action["prompt"], t0, t_stt, remember=False)
+
     async def _run_turn(self, pcm: bytes) -> None:
         t0 = _now_ms()
         try:
@@ -223,6 +294,10 @@ class Session:
 
             await self._send_json({"type": "asr_final", "text": transcript})
             log.info("asr: %s", transcript)
+            action = actions.detect_action(transcript)
+            if action:
+                await self._run_action(action, t0, t_stt)
+                return
             await self._speak(transcript, t0, t_stt)
         except asyncio.CancelledError:
             raise
@@ -236,6 +311,10 @@ class Session:
     async def _run_text_turn(self, prompt: str) -> None:
         t0 = _now_ms()
         try:
+            action = actions.detect_action(prompt)
+            if action:
+                await self._run_action(action, t0, t0)
+                return
             await self._speak(prompt, t0, t0)
         except asyncio.CancelledError:
             raise
@@ -246,7 +325,7 @@ class Session:
             await self._send_json({"type": "error", "message": f"{type(exc).__name__}: {exc}"[:200]})
             await self._send_json({"type": "tts_end"})
 
-    async def _speak(self, prompt: str, t0: float, t_stt: float) -> None:
+    async def _speak(self, prompt: str, t0: float, t_stt: float, remember: bool = True) -> None:
         assert self.pipeline.llm is not None and self.pipeline.tts is not None
         history = self._history_snapshot()
         sentence_q: asyncio.Queue[str | None] = asyncio.Queue()
@@ -273,7 +352,7 @@ class Session:
                 if buffer.strip():
                     await sentence_q.put(buffer.strip())
                 answer = "".join(answer_parts).strip()
-                if answer:
+                if answer and remember:
                     self._remember_turn(prompt, answer)
             except BaseException as exc:
                 failure.append(exc)

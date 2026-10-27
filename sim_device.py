@@ -38,6 +38,124 @@ async def _text_to_pcm(text: str) -> np.ndarray:
     return decode_mp3_to_pcm16(bytes(mp3), SR)
 
 
+async def run_health(
+    url: str,
+    report: dict,
+    out_path: Path,
+    *,
+    timeout: float = 45.0,
+) -> dict:
+    import websockets
+
+    messages: list[dict] = []
+    audio = bytearray()
+
+    async with websockets.connect(url, max_size=None, open_timeout=10) as ws:
+        await ws.send(json.dumps({
+            "type": "hello",
+            "proto": 1,
+            "device": "simulator",
+            "rate": SR,
+            "ch": 1,
+            "fmt": "pcm_s16le",
+            "token": settings.DEVICE_TOKEN,
+        }))
+        ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
+        messages.append(ack)
+        print(f"<- {ack}")
+
+        await ws.send(json.dumps({"type": "health_report", **report}))
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                print("warning: receive timeout")
+                break
+            try:
+                message = await asyncio.wait_for(ws.recv(), timeout=remaining)
+            except asyncio.TimeoutError:
+                print("warning: receive timeout")
+                break
+            if isinstance(message, (bytes, bytearray)):
+                audio.extend(message)
+                continue
+            try:
+                payload = json.loads(message)
+            except json.JSONDecodeError:
+                continue
+            messages.append(payload)
+            print(f"<- {payload.get('type')}: {message[:160]}")
+            if payload.get("type") == "error":
+                break
+            if payload.get("type") == "metrics":
+                break
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(pcm_to_wav(bytes(audio)))
+    metrics = next((m for m in messages if m.get("type") == "metrics"), {})
+    print(f"audio: {len(audio)} bytes -> {out_path}\nmetrics: {metrics}")
+    return {"messages": messages, "audio_bytes": len(audio), "metrics": metrics}
+
+
+async def run_text(
+    url: str,
+    text: str,
+    out_path: Path,
+    *,
+    timeout: float = 45.0,
+) -> dict:
+    import websockets
+
+    messages: list[dict] = []
+    audio = bytearray()
+
+    async with websockets.connect(url, max_size=None, open_timeout=10) as ws:
+        await ws.send(json.dumps({
+            "type": "hello",
+            "proto": 1,
+            "device": "simulator",
+            "rate": SR,
+            "ch": 1,
+            "fmt": "pcm_s16le",
+            "token": settings.DEVICE_TOKEN,
+        }))
+        ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
+        messages.append(ack)
+        print(f"<- {ack}")
+
+        await ws.send(json.dumps({"type": "text", "text": text}))
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                print("warning: receive timeout")
+                break
+            try:
+                message = await asyncio.wait_for(ws.recv(), timeout=remaining)
+            except asyncio.TimeoutError:
+                print("warning: receive timeout")
+                break
+            if isinstance(message, (bytes, bytearray)):
+                audio.extend(message)
+                continue
+            try:
+                payload = json.loads(message)
+            except json.JSONDecodeError:
+                continue
+            messages.append(payload)
+            print(f"<- {payload.get('type')}: {message[:160]}")
+            if payload.get("type") == "error":
+                break
+            if payload.get("type") == "metrics":
+                break
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(pcm_to_wav(bytes(audio)))
+    metrics = next((m for m in messages if m.get("type") == "metrics"), {})
+    print(f"audio: {len(audio)} bytes -> {out_path}\nmetrics: {metrics}")
+    return {"messages": messages, "audio_bytes": len(audio), "metrics": metrics}
+
+
 async def run_turn(
     url: str,
     pcm: np.ndarray,
@@ -60,6 +178,7 @@ async def run_turn(
             "rate": SR,
             "ch": 1,
             "fmt": "pcm_s16le",
+            "token": settings.DEVICE_TOKEN,
         }))
         try:
             ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
@@ -141,11 +260,38 @@ def main() -> None:
     source.add_argument("--tone", action="store_true", help="send a 440 Hz tone (default)")
     source.add_argument("--text", help="synthesize this sentence with Edge TTS and send it")
     source.add_argument("--wav", help="send a WAV file (any rate/channels, converted to 16k mono)")
+    source.add_argument("--say", help="send a text control message instead of audio")
     parser.add_argument("--url", default=f"ws://127.0.0.1:{settings.PORT}/ws")
     parser.add_argument("--out", default="sim_response.wav")
     parser.add_argument("--seconds", type=float, default=1.2)
     parser.add_argument("--fast", action="store_true", help="do not pace input in real time")
+    parser.add_argument(
+        "--health", action="store_true", help="send a simulated health_report"
+    )
     args = parser.parse_args()
+
+    if args.health:
+        report = {
+            "type": "health_report",
+            "id": "sim-health-1",
+            "source": "simulator",
+            "bpm": 82,
+            "spo2": 98,
+            "bpm_quality": 80,
+            "spo2_quality": 75,
+            "signal_quality": 72,
+            "duration_s": 30,
+            "baseline": {"valid": True, "bpm": 70, "spo2": 98, "samples": 5},
+            "history": [],
+        }
+        print(f"sending health report to {args.url}")
+        asyncio.run(run_health(args.url, report, Path(args.out)))
+        return
+
+    if args.say:
+        print(f"sending text to {args.url}")
+        asyncio.run(run_text(args.url, args.say, Path(args.out)))
+        return
 
     pcm = _build_pcm(args)
     print(f"sending {len(pcm) / SR:.2f} s of audio to {args.url}")

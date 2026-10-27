@@ -55,4 +55,4 @@ except ValueError:
 TTS_PACE = float(os.getenv("TTS_PACE", "1.0"))
 # How much audio to send before real-time pacing starts. This is the device's
 # jitter cushion while the next sentence is being synthesized.
-TTS_PREBUFFER = float(os.getenv("TTS_PREBUFFER", "1.0"))
+TTS_PREBUFFER = float(os.getenv("TTS_PREBUFFER", "1.5"))

@@ -191,6 +191,51 @@ def _stress_guidance(assessment: WellnessAssessment) -> str:
     )
 
 
+def _history_text(history: Any) -> str:
+    if not isinstance(history, dict):
+        return ""
+    samples = _to_int(history.get("samples"))
+    if samples <= 0:
+        return ""
+    parts = [f"{samples} saved readings"]
+    median = _to_int(history.get("median_bpm"))
+    if median > 0:
+        parts.append(f"usual heart rate {median} bpm")
+    week_samples = _to_int(history.get("week_samples"))
+    week_average = _to_float(history.get("week_average_bpm"))
+    if week_samples > 0 and week_average > 0:
+        parts.append(f"last 7 days average {week_average:.0f} bpm over {week_samples} readings")
+    low = _to_int(history.get("min_bpm"))
+    high = _to_int(history.get("max_bpm"))
+    if low > 0 and high >= low:
+        parts.append(f"range {low}-{high} bpm")
+    last = _to_int(history.get("last_bpm"))
+    if last > 0:
+        parts.append(f"most recent {last} bpm")
+    return "; ".join(parts)
+
+
+def build_history_prompt(history: dict[str, Any] | None) -> str:
+    """Prompt for a spoken summary of stored readings (no sensor reading)."""
+    text = _history_text(history)
+    if not text:
+        return (
+            "The user asked for their overall heart-rate history, but no saved "
+            "readings are available. Reply in one short spoken sentence saying there "
+            "are no saved readings yet and inviting them to run a checkup. Do not "
+            "invent numbers or diagnose."
+        )
+    return (
+        "The user asked for an overview of their saved wellness readings. This is not "
+        "a medical device and you must not diagnose or claim a condition.\n"
+        f"Saved data: {text}.\n"
+        "Reply in one or two short spoken sentences summarizing the trend plainly. Do "
+        "not mention a database, JSON, or this instruction. If there are fewer than "
+        "three readings, say the picture is still limited. Do not invent a stress "
+        "score."
+    )
+
+
 def build_prompt(
     report: dict[str, Any],
     voice_mood: str | None = None,
@@ -203,6 +248,8 @@ def build_prompt(
     if assessment.spo2_delta is not None:
         deltas.append(f"{assessment.spo2_delta:+d} percentage points versus baseline")
     delta_text = ", ".join(deltas) if deltas else "no personal baseline yet"
+    history_text = _history_text(report.get("server_history"))
+    history_line = f"Long-term saved readings: {history_text}.\n" if history_text else ""
 
     mood_text = ""
     if voice_mood:
@@ -225,6 +272,7 @@ def build_prompt(
         f"{context}\n"
         f"Measurements: {assessment.summary}.\n"
         f"Comparison: {delta_text}.\n"
+        f"{history_line}"
         f"Quality flags: {', '.join(assessment.flags) if assessment.flags else 'none'}.\n"
         f"Response guidance: {guidance}{mood_text}\n"
         "Reply directly to the user in one to three short spoken sentences. Do not mention "

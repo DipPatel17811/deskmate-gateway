@@ -21,6 +21,7 @@ from typing import Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 import actions
+import health_db
 import settings
 import wellness
 from audio_utils import chunks
@@ -49,7 +50,13 @@ async def _prewarm_tts() -> None:
 
 @app.on_event("startup")
 async def _on_startup() -> None:
+    await health_db.init()
     asyncio.create_task(_prewarm_tts())
+
+
+@app.on_event("shutdown")
+async def _on_shutdown() -> None:
+    await health_db.close()
 
 
 
@@ -75,6 +82,7 @@ class Session:
         self.history: list[dict[str, str]] = []
         self.health: dict[str, Any] = {}
         self.health_focus = "wellness"
+        self.device = "deskmate"
         self.authorized = not bool(settings.DEVICE_TOKEN)
 
     def _token_ok(self, token: Any) -> bool:
@@ -144,6 +152,9 @@ class Session:
                 await self._reject_unauthorized()
                 return
             self.authorized = True
+            name = msg.get("device")
+            if isinstance(name, str) and name.strip():
+                self.device = name.strip()[:64]
             await self._send_json({"type": "hello_ack", "proto": 1, **self.pipeline.describe()})
             return
 
@@ -231,6 +242,11 @@ class Session:
                 await self._send_json({"type": "error", "message": "health reply unavailable"})
                 await self._send_json({"type": "tts_end"})
                 return
+            if await health_db.add_reading(self.device, report):
+                history = await health_db.summary(self.device)
+                if history:
+                    report["server_history"] = history
+                    log.info("health history: %s saved readings", history.get("samples"))
             prompt = wellness.build_prompt(report, focus=focus)
             await self._speak(prompt, t0, t0, remember=False)
         except asyncio.CancelledError:
@@ -289,6 +305,25 @@ class Session:
         log.info("action: %s (%s)", action["name"], action_id)
         await self._speak(action["prompt"], t0, t_stt, remember=False)
 
+    async def _run_health_summary(self, t0: float, t_stt: float) -> None:
+        try:
+            history = await health_db.summary(self.device)
+            log.info(
+                "health summary requested: %s saved readings",
+                (history or {}).get("samples", 0),
+            )
+            await self._speak(wellness.build_history_prompt(history), t0, t_stt, remember=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - surfaced to the device UI
+            if isinstance(exc, ExceptionGroup) and exc.exceptions:
+                exc = exc.exceptions[0]
+            log.exception("health summary failed: %s", exc)
+            await self._send_json(
+                {"type": "error", "message": f"{type(exc).__name__}: {exc}"[:200]}
+            )
+            await self._send_json({"type": "tts_end"})
+
     async def _run_turn(self, pcm: bytes) -> None:
         t0 = _now_ms()
         try:
@@ -303,7 +338,10 @@ class Session:
             log.info("asr: %s", transcript)
             action = actions.detect_action(transcript)
             if action:
-                await self._run_action(action, t0, t_stt)
+                if action["name"] == "health_summary":
+                    await self._run_health_summary(t0, t_stt)
+                else:
+                    await self._run_action(action, t0, t_stt)
                 return
             await self._speak(transcript, t0, t_stt)
         except asyncio.CancelledError:
@@ -320,7 +358,10 @@ class Session:
         try:
             action = actions.detect_action(prompt)
             if action:
-                await self._run_action(action, t0, t0)
+                if action["name"] == "health_summary":
+                    await self._run_health_summary(t0, t0)
+                else:
+                    await self._run_action(action, t0, t0)
                 return
             await self._speak(prompt, t0, t0)
         except asyncio.CancelledError:

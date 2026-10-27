@@ -29,6 +29,8 @@ services:
       - key: TTS_PACE
         value: "1.0"
       - key: TTS_PREBUFFER
-        value: "1.0"
+        value: "1.5"
+      - key: DATABASE_URL
+        sync: false
       - key: MAX_HISTORY_TURNS
         value: "8"

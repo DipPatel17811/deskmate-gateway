@@ -141,6 +141,7 @@ class Session:
         self.wake_active = False
         self.heartbeat: asyncio.Task[None] | None = None
         self.turn: asyncio.Task[None] | None = None
+        self.send_lock = asyncio.Lock()
         self.history: list[dict[str, str]] = []
         self.health: dict[str, Any] = {}
         self.health_focus = "wellness"
@@ -215,7 +216,10 @@ class Session:
     async def _send_json(self, payload: dict[str, Any]) -> None:
         try:
             raw = json.dumps(payload, separators=(",", ":"))
-            await self.ws.send_text(raw)
+            # Starlette WebSocket does not allow concurrent sends. The
+            # heartbeat, audio stream, and control replies all share this lock.
+            async with self.send_lock:
+                await self.ws.send_text(raw)
             stats.add_out(len(raw))
             stats.session_bytes(self.sid, sent=len(raw))
             if payload.get("type") == "error":
@@ -225,7 +229,8 @@ class Session:
 
     async def _send_bytes(self, data: bytes) -> None:
         try:
-            await self.ws.send_bytes(data)
+            async with self.send_lock:
+                await self.ws.send_bytes(data)
             stats.add_out(len(data))
             stats.session_bytes(self.sid, sent=len(data))
         except (WebSocketDisconnect, RuntimeError):

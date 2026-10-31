@@ -284,6 +284,13 @@ class Session:
             self.pcm.clear()
             self._reset_history()
             await self._send_json({"type": "chat_reset"})
+        elif kind == "speaker":
+            on = msg.get("on")
+            if isinstance(on, bool):
+                self.speaker = on
+                if not on:
+                    await self._cancel_turn()
+                await self._send_json({"type": "speaker_ack", "on": on})
         elif kind == "wake_start":
             self.wake_active = True
             self.wake_buf.clear()

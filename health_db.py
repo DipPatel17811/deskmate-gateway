@@ -157,6 +157,7 @@ async def summary(device: str) -> dict[str, Any] | None:
                     avg(bpm)::float8 AS average_bpm,
                     min(bpm) AS min_bpm,
                     max(bpm) AS max_bpm,
+                    min(recorded_at) AS first_at,
                     count(*) FILTER (
                         WHERE recorded_at > NOW() - INTERVAL '7 days'
                     ) AS week_samples,
@@ -195,11 +196,57 @@ async def summary(device: str) -> dict[str, Any] | None:
         "week_average_bpm": (
             round(float(row["week_average_bpm"]), 1) if row["week_average_bpm"] else None
         ),
+        "first_at": row["first_at"].isoformat() if row["first_at"] else None,
+        "days": (
+            max(1, (time.time() - row["first_at"].timestamp()) / 86400)
+            if row["first_at"]
+            else 0
+        ),
     }
     if last is not None:
         result["last_bpm"] = int(last["bpm"])
         result["last_at"] = last["recorded_at"].isoformat() if last["recorded_at"] else None
+    week_avg = result.get("week_average_bpm")
+    overall = result.get("average_bpm")
+    if week_avg is not None and overall is not None:
+        result["trend_bpm"] = round(float(week_avg) - float(overall), 1)
     return result
+
+
+async def recent(limit: int = 25) -> list[dict[str, Any]]:
+    """Latest readings for the dashboard, newest first."""
+    pool = await _get_pool()
+    if pool is None:
+        return []
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT device, bpm, spo2, bpm_quality, spo2_quality,
+                       signal_quality, duration_s, source, recorded_at
+                FROM health_readings
+                ORDER BY recorded_at DESC
+                LIMIT $1
+                """,
+                max(1, min(int(limit), 200)),
+            )
+    except Exception as exc:  # noqa: BLE001 - dashboard only
+        log.warning("could not read recent health rows: %s", exc)
+        return []
+    return [
+        {
+            "device": row["device"],
+            "bpm": int(row["bpm"]),
+            "spo2": int(row["spo2"]) if row["spo2"] else None,
+            "bpm_quality": int(row["bpm_quality"]) if row["bpm_quality"] else None,
+            "spo2_quality": int(row["spo2_quality"]) if row["spo2_quality"] else None,
+            "signal_quality": int(row["signal_quality"]) if row["signal_quality"] else None,
+            "duration_s": int(row["duration_s"]) if row["duration_s"] else None,
+            "source": row["source"],
+            "recorded_at": row["recorded_at"].isoformat() if row["recorded_at"] else None,
+        }
+        for row in rows
+    ]
 
 
 async def close() -> None:
@@ -212,3 +259,7 @@ async def close() -> None:
 async def init() -> None:
     """Create the pool and table at startup; failures are retried lazily."""
     await _get_pool()
+
+
+def ready() -> bool:
+    return _pool is not None

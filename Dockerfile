@@ -13,4 +13,4 @@ COPY . .
 
 EXPOSE 8765
 
-CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8765}"]
+CMD ["python", "run.py"]

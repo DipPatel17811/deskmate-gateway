@@ -15,24 +15,41 @@ import asyncio
 import hmac
 import json
 import logging
+import re
 import time
 from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 
 import actions
 import health_db
 import settings
+import stats
 import wellness
 from audio_utils import chunks
+from dashboard import DASHBOARD_HTML
 from protocol import split_sentences
 from providers import Pipeline, build_pipeline
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("deskmate")
 
-app = FastAPI(title="Desk Mate Gateway")
+app = FastAPI(title="Calmi Gateway")
 PIPELINE: Pipeline = build_pipeline(settings)
+
+# "Hello Calmi" is detected on the server from a short, locally gated speech
+# clip. The firmware only uploads when its own energy gate sees speech.
+WAKE_RE = re.compile(
+    r"(?:^|\b(?:hello|hi|hey|okay|ok)\s+)"
+    r"(?:calmi|calmie|calmy|calm me|calmee|karmi)\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_wake(text: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9\s]", " ", text.lower())
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
 def _now_ms() -> float:
@@ -65,25 +82,71 @@ async def healthz() -> dict[str, Any]:
     return {"ok": True, **PIPELINE.describe()}
 
 
+def _service_spec() -> dict[str, Any]:
+    """Public, secret-free description of the running gateway."""
+    db_ready = health_db.ready()
+    return {
+        **PIPELINE.describe(),
+        "sample_rate": settings.SAMPLE_RATE,
+        "frame_ms": int(settings.FRAME_SAMPLES * 1000 / settings.SAMPLE_RATE),
+        "tts_pace": settings.TTS_PACE,
+        "tts_prebuffer": settings.TTS_PREBUFFER,
+        "device_token_set": bool(settings.DEVICE_TOKEN),
+        "database": db_ready,
+        "wake_word": "Hello Calmi",
+        "proto": 1,
+    }
+
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard() -> str:
+    return DASHBOARD_HTML
+
+
+@app.get("/api/status")
+async def api_status() -> dict[str, Any]:
+    return stats.snapshot(PIPELINE.describe(), _service_spec())
+
+
+@app.get("/api/readings")
+async def api_readings(limit: int = 25) -> dict[str, Any]:
+    return {"readings": await health_db.recent(limit)}
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket) -> None:
     await ws.accept()
+    client = f"{ws.client.host}:{ws.client.port}" if ws.client else "unknown"
     log.info("device connected (%s)", ws.client)
-    await Session(ws, PIPELINE).run()
+    session = Session(ws, PIPELINE, client)
+    stats.session_open(session.sid, client)
+    try:
+        await session.run()
+    finally:
+        stats.session_close(session.sid)
     log.info("device disconnected")
 
 
 class Session:
-    def __init__(self, ws: WebSocket, pipeline: Pipeline) -> None:
+    _next_id = 0
+
+    def __init__(self, ws: WebSocket, pipeline: Pipeline, client: str = "unknown") -> None:
+        Session._next_id += 1
+        self.sid = f"s{Session._next_id}"
+        self.client = client
         self.ws = ws
         self.pipeline = pipeline
         self.pcm = bytearray()
+        self.wake_buf = bytearray()
+        self.wake_active = False
+        self.heartbeat: asyncio.Task[None] | None = None
         self.turn: asyncio.Task[None] | None = None
         self.history: list[dict[str, str]] = []
         self.health: dict[str, Any] = {}
         self.health_focus = "wellness"
         self.device = "deskmate"
         self.authorized = not bool(settings.DEVICE_TOKEN)
+        self.speaker = True
 
     def _token_ok(self, token: Any) -> bool:
         if not settings.DEVICE_TOKEN:
@@ -129,15 +192,48 @@ class Session:
         except WebSocketDisconnect:
             pass
         finally:
+            if self.heartbeat is not None and not self.heartbeat.done():
+                self.heartbeat.cancel()
             await self._cancel_turn()
+
+    async def _heartbeat_loop(self) -> None:
+        """Application-level keepalive.
+
+        Protocol ping frames were being dropped somewhere between Render's proxy
+        and the device, which killed healthy sockets after ~25 s. A normal text
+        frame survives every proxy we tested.
+        """
+        try:
+            while True:
+                await asyncio.sleep(15)
+                await self._send_json({"type": "ping", "ts": int(time.time() * 1000)})
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - the receive loop reports the disconnect
+            return
 
     async def _send_json(self, payload: dict[str, Any]) -> None:
         try:
-            await self.ws.send_text(json.dumps(payload, separators=(",", ":")))
+            raw = json.dumps(payload, separators=(",", ":"))
+            await self.ws.send_text(raw)
+            stats.add_out(len(raw))
+            stats.session_bytes(self.sid, sent=len(raw))
+            if payload.get("type") == "error":
+                stats.count_error()
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+
+    async def _send_bytes(self, data: bytes) -> None:
+        try:
+            await self.ws.send_bytes(data)
+            stats.add_out(len(data))
+            stats.session_bytes(self.sid, sent=len(data))
         except (WebSocketDisconnect, RuntimeError):
             pass
 
     async def _on_control(self, raw: str) -> None:
+        stats.add_in(len(raw))
+        stats.session_bytes(self.sid, received=len(raw))
         try:
             msg = json.loads(raw)
         except json.JSONDecodeError:
@@ -147,15 +243,24 @@ class Session:
             return
 
         kind = msg.get("type")
+        if kind == "pong":
+            return
         if kind == "hello":
             if not self._token_ok(msg.get("token")):
                 await self._reject_unauthorized()
                 return
             self.authorized = True
+            speaker = msg.get("speaker")
+            if isinstance(speaker, bool):
+                self.speaker = speaker
             name = msg.get("device")
             if isinstance(name, str) and name.strip():
                 self.device = name.strip()[:64]
+            stats.session_hello(self.sid, self.device, True)
+            stats.event("hello", self.device)
             await self._send_json({"type": "hello_ack", "proto": 1, **self.pipeline.describe()})
+            if self.heartbeat is None or self.heartbeat.done():
+                self.heartbeat = asyncio.create_task(self._heartbeat_loop())
             return
 
         if not self.authorized:
@@ -171,12 +276,19 @@ class Session:
         elif kind == "cancel":
             await self._cancel_turn()
             self.pcm.clear()
+            self.wake_active = False
+            self.wake_buf.clear()
             await self._send_json({"type": "cancel_ack"})
         elif kind in ("new_chat", "newchat", "reset"):
             await self._cancel_turn()
             self.pcm.clear()
             self._reset_history()
             await self._send_json({"type": "chat_reset"})
+        elif kind == "wake_start":
+            self.wake_active = True
+            self.wake_buf.clear()
+        elif kind == "wake_end":
+            await self._finish_wake()
         elif kind == "text":
             prompt = msg.get("text")
             if not isinstance(prompt, str) or not prompt.strip():
@@ -186,6 +298,7 @@ class Session:
             await self._cancel_turn()
             self.pcm.clear()
             log.info("text: %s", prompt[:200])
+            stats.event("text", prompt[:120])
             self.turn = asyncio.create_task(self._run_text_turn(prompt))
         elif kind == "health_report":
             await self._on_health_report(msg)
@@ -196,11 +309,36 @@ class Session:
             )
 
     async def _on_audio(self, data: bytes) -> None:
+        stats.add_in(len(data))
+        stats.session_bytes(self.sid, received=len(data))
+        if self.wake_active:
+            limit = settings.SAMPLE_RATE * 2 * 4
+            if len(self.wake_buf) < limit:
+                self.wake_buf.extend(data[: limit - len(self.wake_buf)])
+            return
         limit = settings.MAX_UTTERANCE_SECONDS * settings.SAMPLE_RATE * 2
         if len(self.pcm) < limit:
             self.pcm.extend(data[: limit - len(self.pcm)])
         if self.pipeline.mode == "echo":
-            await self.ws.send_bytes(data)
+            await self._send_bytes(data)
+
+    async def _finish_wake(self) -> None:
+        self.wake_active = False
+        audio = bytes(self.wake_buf)
+        self.wake_buf.clear()
+        matched = False
+        transcript = ""
+        if audio and self.pipeline.stt is not None:
+            try:
+                transcript = (await self.pipeline.stt.transcribe(audio)).strip()
+                matched = bool(WAKE_RE.search(_normalize_wake(transcript)))
+            except Exception as exc:  # noqa: BLE001 - wake is best effort
+                log.warning("wake check failed: %s", exc)
+        stats.count_wake(matched)
+        if matched:
+            stats.event("wake", transcript[:120])
+            log.info("wake word matched: %s", transcript[:120])
+        await self._send_json({"type": "wake_result", "matched": matched})
 
     async def _on_health_report(self, report: dict[str, Any]) -> None:
         bpm = report.get("bpm")
@@ -219,6 +357,11 @@ class Session:
         report["spo2"] = spo2
 
         self.health = dict(report)
+        stats.count_health()
+        stats.event(
+            "health",
+            f"{report.get('bpm')} bpm / spo2 {report.get('spo2') or '--'}",
+        )
         await self._cancel_turn()
         self.pcm.clear()
         await self._send_json(
@@ -248,7 +391,7 @@ class Session:
                     report["server_history"] = history
                     log.info("health history: %s saved readings", history.get("samples"))
             prompt = wellness.build_prompt(report, focus=focus)
-            await self._speak(prompt, t0, t0, remember=False)
+            await self._speak(prompt, t0, t0, remember=False, kind="health")
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - surfaced to the device UI
@@ -303,7 +446,9 @@ class Session:
             "duration_s": action["duration_s"],
         })
         log.info("action: %s (%s)", action["name"], action_id)
-        await self._speak(action["prompt"], t0, t_stt, remember=False)
+        stats.count_action()
+        stats.event("action", action["name"])
+        await self._speak(action["prompt"], t0, t_stt, remember=False, kind="action")
 
     async def _run_health_summary(self, t0: float, t_stt: float) -> None:
         try:
@@ -312,7 +457,7 @@ class Session:
                 "health summary requested: %s saved readings",
                 (history or {}).get("samples", 0),
             )
-            await self._speak(wellness.build_history_prompt(history), t0, t_stt, remember=False)
+            await self._speak(wellness.build_history_prompt(history), t0, t_stt, remember=False, kind="survey")
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - surfaced to the device UI
@@ -373,12 +518,58 @@ class Session:
             await self._send_json({"type": "error", "message": f"{type(exc).__name__}: {exc}"[:200]})
             await self._send_json({"type": "tts_end"})
 
-    async def _speak(self, prompt: str, t0: float, t_stt: float, remember: bool = True) -> None:
+    async def _speak_text_only(self, prompt: str, t0: float, t_stt: float,
+                               remember: bool, kind: str) -> None:
+        """No-speaker devices only need the streamed text; skip TTS entirely."""
+        answer_parts: list[str] = []
+        llm_ms = 0
+        try:
+            async for delta in self.pipeline.llm.stream(prompt, history=self._history_snapshot()):
+                if not delta:
+                    continue
+                if llm_ms == 0:
+                    llm_ms = int(_now_ms() - t_stt)
+                answer_parts.append(delta)
+                await self._send_json({"type": "llm_delta", "text": delta})
+            total_ms = int(_now_ms() - t0)
+            answer = "".join(answer_parts).strip()
+            if answer and remember:
+                self._remember_turn(prompt, answer)
+            await self._send_json({"type": "tts_start"})
+            await self._send_json({"type": "tts_end"})
+            await self._send_json(
+                {
+                    "type": "metrics",
+                    "stt_ms": int(t_stt - t0),
+                    "llm_ms": llm_ms,
+                    "tts_ms": 0,
+                    "total_ms": total_ms,
+                    "audio_ms": 0,
+                }
+            )
+            stats.session_turn(self.sid)
+            stats.add_latency(kind, total_ms, total_ms, 0)
+            if kind != "chat":
+                stats.event(kind, f"text {total_ms} ms")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - surfaced to the device UI
+            if isinstance(exc, ExceptionGroup) and exc.exceptions:
+                exc = exc.exceptions[0]
+            log.exception("text turn failed: %s", exc)
+            await self._send_json({"type": "error", "message": f"{type(exc).__name__}: {exc}"[:200]})
+            await self._send_json({"type": "tts_end"})
+
+    async def _speak(self, prompt: str, t0: float, t_stt: float, remember: bool = True,
+                     kind: str = "chat") -> None:
         assert self.pipeline.llm is not None and self.pipeline.tts is not None
+        if not self.speaker:
+            await self._speak_text_only(prompt, t0, t_stt, remember, kind)
+            return
         history = self._history_snapshot()
         sentence_q: asyncio.Queue[str | None] = asyncio.Queue()
         audio_q: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=8)
-        stats: dict[str, float] = {"llm": 0.0, "tts": 0.0, "total": 0.0, "audio": 0.0}
+        timing: dict[str, float] = {"llm": 0.0, "tts": 0.0, "total": 0.0, "audio": 0.0}
         audio_sent = False
         failure: list[BaseException] = []
 
@@ -389,8 +580,8 @@ class Session:
                 async for delta in self.pipeline.llm.stream(prompt, history=history):
                     if not delta:
                         continue
-                    if stats["llm"] == 0.0:
-                        stats["llm"] = _now_ms() - t_stt
+                    if timing["llm"] == 0.0:
+                        timing["llm"] = _now_ms() - t_stt
                     answer_parts.append(delta)
                     await self._send_json({"type": "llm_delta", "text": delta})
                     buffer += delta
@@ -450,11 +641,11 @@ class Session:
                     del pending[: settings.FRAME_BYTES]
                     if not audio_sent:
                         await self._send_json({"type": "tts_start"})
-                        stats["tts"] = _now_ms() - t_stt - stats["llm"]
-                        stats["total"] = _now_ms() - t0
+                        timing["tts"] = _now_ms() - t_stt - timing["llm"]
+                        timing["total"] = _now_ms() - t0
                         audio_sent = True
-                    await self.ws.send_bytes(chunk)
-                    stats["audio"] += len(chunk) * 1000.0 / (settings.SAMPLE_RATE * 2)
+                    await self._send_bytes(chunk)
+                    timing["audio"] += len(chunk) * 1000.0 / (settings.SAMPLE_RATE * 2)
                     frames += 1
                     if settings.TTS_PACE > 0 and frames > prebuffer:
                         # Pace against an absolute clock. A per-frame
@@ -479,11 +670,11 @@ class Session:
             if pending:
                 if not audio_sent:
                     await self._send_json({"type": "tts_start"})
-                    stats["tts"] = _now_ms() - t_stt - stats["llm"]
-                    stats["total"] = _now_ms() - t0
+                    timing["tts"] = _now_ms() - t_stt - timing["llm"]
+                    timing["total"] = _now_ms() - t0
                     audio_sent = True
-                await self.ws.send_bytes(bytes(pending))
-                stats["audio"] += len(pending) * 1000.0 / (settings.SAMPLE_RATE * 2)
+                await self._send_bytes(bytes(pending))
+                timing["audio"] += len(pending) * 1000.0 / (settings.SAMPLE_RATE * 2)
 
             if not audio_sent:
                 if failure:
@@ -491,20 +682,29 @@ class Session:
                 await self._send_json({"type": "error", "message": "empty reply"})
             log.info(
                 "turn: stt %d ms, llm %d ms, tts %d ms, ttfa %d ms, audio %d ms",
-                int(t_stt - t0), int(stats["llm"]), int(stats["tts"]),
-                int(stats["total"]), int(stats["audio"]),
+                int(t_stt - t0), int(timing["llm"]), int(timing["tts"]),
+                int(timing["total"]), int(timing["audio"]),
             )
             await self._send_json({"type": "tts_end"})
             await self._send_json(
                 {
                     "type": "metrics",
                     "stt_ms": int(t_stt - t0),
-                    "llm_ms": int(stats["llm"]),
-                    "tts_ms": int(stats["tts"]),
-                    "total_ms": int(stats["total"]),
-                    "audio_ms": int(stats["audio"]),
+                    "llm_ms": int(timing["llm"]),
+                    "tts_ms": int(timing["tts"]),
+                    "total_ms": int(timing["total"]),
+                    "audio_ms": int(timing["audio"]),
                 }
             )
+            stats.session_turn(self.sid)
+            stats.add_latency(
+                kind,
+                int(timing["total"]),
+                int(timing["total"]),
+                int(timing["audio"]),
+            )
+            if kind != "chat":
+                stats.event(kind, f"ttfa {int(timing['total'])} ms")
 
         async with asyncio.TaskGroup() as tg:
             tg.create_task(produce())

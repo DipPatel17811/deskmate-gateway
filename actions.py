@@ -29,6 +29,23 @@ _SUMMARY_PATTERNS = (
     ),
     re.compile(r"\b(past|saved|previous|earlier|recent)\b.*\breadings?\b"),
     re.compile(r"\breadings?\b.*\b(so far|over time|history|trend|average|summary)\b"),
+    # "analyze my previous heart rate" asks for a survey of stored data, not a
+    # new sensor reading.
+    re.compile(
+        r"\b(analyse|analyze|analysis|survey|review|summarise|summarize)\b"
+        r".*\b(previous|past|saved|recorded|earlier|old|history)\b"
+        r".*\b(heart rate|heart|bpm|pulse|readings?|health|wellness)\b"
+    ),
+    re.compile(
+        r"\b(previous|past|saved|recorded|earlier|old)\b"
+        r".*\b(heart rate|heart|bpm|pulse|readings?|health|wellness)\b"
+        r".*\b(analysis|survey|summary|overview|trend|average)\b"
+    ),
+    re.compile(
+        r"\b(tell me|give me|make|do|run|show)\b"
+        r".*\b(survey|overview|summary|analysis)\b"
+        r".*\b(heart rate|heart|bpm|pulse|readings?|health|wellness)\b"
+    ),
 )
 
 _HEALTH_PATTERNS = (

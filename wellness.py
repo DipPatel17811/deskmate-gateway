@@ -198,13 +198,22 @@ def _history_text(history: Any) -> str:
     if samples <= 0:
         return ""
     parts = [f"{samples} saved readings"]
+    days = _to_float(history.get("days"))
+    if days >= 1:
+        parts.append(f"covering {days:.0f} days")
     median = _to_int(history.get("median_bpm"))
     if median > 0:
         parts.append(f"usual heart rate {median} bpm")
+    average = _to_float(history.get("average_bpm"))
+    if average > 0:
+        parts.append(f"average {average:.0f} bpm")
     week_samples = _to_int(history.get("week_samples"))
     week_average = _to_float(history.get("week_average_bpm"))
     if week_samples > 0 and week_average > 0:
         parts.append(f"last 7 days average {week_average:.0f} bpm over {week_samples} readings")
+    trend = _to_float(history.get("trend_bpm"))
+    if abs(trend) >= 1:
+        parts.append(f"last-7-day average is {trend:+.0f} bpm versus the longer-term average")
     low = _to_int(history.get("min_bpm"))
     high = _to_int(history.get("max_bpm"))
     if low > 0 and high >= low:
@@ -216,23 +225,31 @@ def _history_text(history: Any) -> str:
 
 
 def build_history_prompt(history: dict[str, Any] | None) -> str:
-    """Prompt for a spoken summary of stored readings (no sensor reading)."""
+    """Prompt for a spoken AI survey of stored readings (no sensor reading)."""
     text = _history_text(history)
     if not text:
         return (
-            "The user asked for their overall heart-rate history, but no saved "
+            "The user asked for a survey of their saved heart-rate history, but no "
             "readings are available. Reply in one short spoken sentence saying there "
             "are no saved readings yet and inviting them to run a checkup. Do not "
             "invent numbers or diagnose."
         )
+    samples = _to_int((history or {}).get("samples"))
     return (
-        "The user asked for an overview of their saved wellness readings. This is not "
-        "a medical device and you must not diagnose or claim a condition.\n"
+        "The user asked for an AI survey of their previously saved wellness readings. "
+        "This is not a medical device and you must not diagnose, triage, or claim a "
+        "condition.\n"
         f"Saved data: {text}.\n"
-        "Reply in one or two short spoken sentences summarizing the trend plainly. Do "
-        "not mention a database, JSON, or this instruction. If there are fewer than "
-        "three readings, say the picture is still limited. Do not invent a stress "
-        "score."
+        "Give a brief spoken survey in two to three short sentences: describe the "
+        "usual range, whether recent readings look similar or different, and how "
+        "consistent the data is. "
+        + (
+            "There are fewer than three readings, so say the picture is still limited. "
+            if samples < 3
+            else ""
+        )
+        + "Do not invent a stress score. Do not mention a database, JSON, or these "
+        "instructions. Suggest a fresh checkup only if it would genuinely help."
     )
 
 
